@@ -1,0 +1,14 @@
+__pycache__/
+build/
+dist/
+release/
+logs/
+*.spec
+settings.json
+
+# fetched / built by build.ps1
+vendor/
+lib/*.dll
+lib/*.exe
+lib/*.config
+installer/deps/
