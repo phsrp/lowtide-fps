@@ -42,7 +42,7 @@ from collections import deque
 from datetime import datetime
 
 APP = "Lowtide"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 REPO = "phsrp/lowtide-fps"
 FROZEN = getattr(sys, "frozen", False)
 HERE = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
@@ -362,13 +362,29 @@ class Capture:
         self.procs = {}   # (pid, swap chain) -> ProcStats
         self.proc = None
         self.error = None
+        self.started = time.time()
+        self.last_row = 0.0       # any frame from any app, including the desktop (dwm)
+
+    def status_text(self):
+        """What the overlay says while there's no game to show."""
+        if self.error:
+            return self.error
+        quiet = time.time() - max(self.last_row, self.started)
+        if quiet > 15:
+            # Windows hands out no frame events at all: usually another tool's trace session
+            # (a crashed or force-closed FPS / hardware monitor) is hogging them
+            return "No frames from Windows. Another FPS or monitoring tool may be blocking it"
+        return "Waiting for a game"
 
     def start(self):
+        # Only MsBetweenPresents is used, so skip display / GPU / input tracking: far fewer
+        # events, so Windows doesn't drop frames when other tools (Discord, Steam...) trace too
         args = [self.presentmon, "--output_stdout", "--no_console_stats",
                 "--stop_existing_session", "--session_name", "Lowtide",
-                "--no_track_input", "--no_track_gpu"]
+                "--no_track_input", "--no_track_gpu", "--no_track_display"]
         for e in EXCLUDE:
-            args += ["--exclude", e]
+            if e != "dwm.exe":  # the desktop's frames prove events are arriving; dropped below
+                args += ["--exclude", e]
         self.proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                      stdin=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW,
                                      bufsize=1, text=True, encoding="utf-8", errors="replace")
@@ -396,6 +412,9 @@ class Capture:
                 last_start = {}
                 continue
             if len(row) < len(header):
+                continue
+            self.last_row = time.time()
+            if row[i_app].lower() == "dwm.exe":
                 continue
             try:
                 # one game can present from several swap chains (launcher UI, video...);
@@ -792,8 +811,9 @@ class Overlay:
         r = self.stats(fts)
         if show_frames:
             if r is None:
-                t(pad, y, self.cap.error or "Waiting for a game", MUTED, FONT_MED, 11)
-                y += px(26)
+                msg = self.c.create_text(pad, y, text=self.cap.status_text(), fill=MUTED, anchor="nw",
+                                         font=self.font(FONT_MED, 11), width=W - 2 * pad)
+                y = self.c.bbox(msg)[3] + px(12)
             else:
                 avg, l1, l01 = r
                 cur, cur_ft = current_fps(recent)
@@ -879,7 +899,7 @@ class Overlay:
             if g:
                 groups.append(g)
         elif s["show_fps"] or s["show_lows"]:
-            groups.append([("Waiting for a game", MUTED, FONT_MED)])
+            groups.append([(self.cap.status_text(), MUTED, FONT_MED)])
         for key in ("cpu", "gpu"):
             if s[f"show_{key}"]:
                 temp, load = self.sensors.get(f"{key}_temp"), self.sensors.get(f"{key}_load")
