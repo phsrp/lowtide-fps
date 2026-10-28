@@ -42,7 +42,7 @@ from collections import deque
 from datetime import datetime
 
 APP = "Lowtide"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 REPO = "phsrp/lowtide-fps"
 FROZEN = getattr(sys, "frozen", False)
 HERE = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
@@ -620,6 +620,55 @@ def foreground_pid():
     return pid.value
 
 
+def process_name(pid):
+    """exe name of a process, e.g. "GeometryDash.exe" ("" if it can't be read)."""
+    h = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wt.DWORD(len(buf))
+        if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+            return os.path.basename(buf.value)
+        return ""
+    finally:
+        kernel32.CloseHandle(h)
+
+
+class MODULEENTRY32W(ctypes.Structure):
+    _fields_ = [("dwSize", wt.DWORD), ("th32ModuleID", wt.DWORD), ("th32ProcessID", wt.DWORD),
+                ("GlblcntUsage", wt.DWORD), ("ProccntUsage", wt.DWORD),
+                ("modBaseAddr", ctypes.c_void_p), ("modBaseSize", wt.DWORD), ("hModule", wt.HMODULE),
+                ("szModule", ctypes.c_wchar * 256), ("szExePath", ctypes.c_wchar * 260)]
+
+
+_opengl_cache = {}
+
+
+def uses_opengl(pid):
+    """True if the process has opengl32.dll loaded. Classic OpenGL games present through GDI,
+    which Windows doesn't report to PresentMon (or any tool that doesn't inject)."""
+    if pid in _opengl_cache:
+        return _opengl_cache[pid]
+    found = False
+    kernel32.CreateToolhelp32Snapshot.restype = wt.HANDLE
+    snap = kernel32.CreateToolhelp32Snapshot(0x8 | 0x10, pid)  # SNAPMODULE | SNAPMODULE32
+    if snap and snap != wt.HANDLE(-1).value:
+        try:
+            me = MODULEENTRY32W()
+            me.dwSize = ctypes.sizeof(me)
+            ok = kernel32.Module32FirstW(snap, ctypes.byref(me))
+            while ok:
+                if me.szModule.lower() == "opengl32.dll":
+                    found = True
+                    break
+                ok = kernel32.Module32NextW(snap, ctypes.byref(me))
+        finally:
+            kernel32.CloseHandle(snap)
+    _opengl_cache[pid] = found
+    return found
+
+
 def colorref(hex_color):
     r, g, b = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
     return ctypes.c_int(r | (g << 8) | (b << 16))
@@ -663,6 +712,7 @@ class Overlay:
         style |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST
         user32.SetWindowLongW(self.hwnd, GWL_EXSTYLE, style)
         self.last_key = None
+        self.fg_pid, self.fg_name = 0, ""
         self._stats_cache = None
         self.size = None
         self.unlocked = False
@@ -730,11 +780,17 @@ class Overlay:
                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
         self.root.after(100, self.keep_on_top)
 
+    # clicking these doesn't mean you switched apps, so keep showing the last one
+    PASS_THROUGH = {"explorer.exe", "shellexperiencehost.exe", "startmenuexperiencehost.exe",
+                    "searchhost.exe", "lowtide.exe", "python.exe", "pythonw.exe"}
+
     def pick_target(self):
-        """The app in front if it's rendering, else the last one that was in front
-        (e.g. while you alt-tab to check something). Never a random background app."""
+        """Only ever the app in front. Never another app (OBS, a browser...) just because it
+        happens to be drawing - if the app in front sends no frames, show why instead."""
         now = time.time()
         fg = foreground_pid()
+        if fg != self.fg_pid:
+            self.fg_pid, self.fg_name = fg, process_name(fg)
         procs = self.cap.procs
         dead = [k for k, ps in procs.items() if now - ps.last_seen > IDLE_TIMEOUT]
         for k in dead:
@@ -743,9 +799,23 @@ class Overlay:
         fg_keys = [k for k in procs if k[0] == fg]
         if fg_keys:
             return busiest(fg_keys)       # the game's main swap chain presents the most
-        if self.last_key in procs:
+        if self.fg_name.lower() in self.PASS_THROUGH and self.last_key in procs:
             return self.last_key
         return None
+
+    def idle_text(self, short=False):
+        """What to say when the app in front has no frames to show."""
+        base = self.cap.status_text()
+        if base != "Waiting for a game" or not self.fg_pid:
+            return base
+        if self.fg_name.lower() not in self.PASS_THROUGH and uses_opengl(self.fg_pid):
+            name = self.fg_name.removesuffix(".exe").removesuffix(".EXE")
+            if short:
+                return f"{name} uses OpenGL: switch to full view for the fix"
+            return (f"{name} uses OpenGL, which Windows doesn't report frames for. "
+                    "Fix: NVIDIA Control Panel > Manage 3D settings > Vulkan/OpenGL present method "
+                    "> Prefer layered on DXGI swapchain, then restart the game.")
+        return base
 
     def toggle(self):
         self.visible = not self.visible
@@ -811,7 +881,7 @@ class Overlay:
         r = self.stats(fts)
         if show_frames:
             if r is None:
-                msg = self.c.create_text(pad, y, text=self.cap.status_text(), fill=MUTED, anchor="nw",
+                msg = self.c.create_text(pad, y, text=self.idle_text(), fill=MUTED, anchor="nw",
                                          font=self.font(FONT_MED, 11), width=W - 2 * pad)
                 y = self.c.bbox(msg)[3] + px(12)
             else:
@@ -899,7 +969,7 @@ class Overlay:
             if g:
                 groups.append(g)
         elif s["show_fps"] or s["show_lows"]:
-            groups.append([(self.cap.status_text(), MUTED, FONT_MED)])
+            groups.append([(self.idle_text(short=True), MUTED, FONT_MED)])
         for key in ("cpu", "gpu"):
             if s[f"show_{key}"]:
                 temp, load = self.sensors.get(f"{key}_temp"), self.sensors.get(f"{key}_load")

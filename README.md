@@ -102,6 +102,14 @@ It needs administrator rights, because reading frame times (through Windows' eve
 
 CPU temps need the free [PawnIO](https://pawnio.eu/) driver, the same one LibreHardwareMonitor, FanControl and CleanMeter use. The installer has a ticked **Install the PawnIO driver** box that runs PawnIO's official setup (it only shows up if you don't have PawnIO yet). Everything else works without it.
 
+### OpenGL games (Geometry Dash, Minecraft Java...)
+
+Older OpenGL games draw in a way Windows doesn't report, so no tool that reads Windows' frame data can see them (RTSS gets around it by injecting into the game). Lowtide tells you when the game in front is one of these. With an NVIDIA card, there's a quick fix that often lowers input lag too:
+
+1. **NVIDIA Control Panel** → **Manage 3D settings** → **Program Settings**, and pick the game (or use **Global Settings**).
+2. Set **Vulkan/OpenGL present method** to **Prefer layered on DXGI swapchain** and click **Apply**.
+3. Restart the game.
+
 ### Updating
 
 Lowtide checks for a new version every time it starts. When there is one, it asks first, then installs it and restarts by itself. It never asks while a game is running; you get a tray notification instead. You can also click **Check now** in settings.
