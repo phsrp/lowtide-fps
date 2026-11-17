@@ -42,7 +42,7 @@ from collections import deque
 from datetime import datetime
 
 APP = "Lowtide"
-VERSION = "1.0.2"
+VERSION = "1.1.0"
 REPO = "phsrp/lowtide-fps"
 FROZEN = getattr(sys, "frozen", False)
 HERE = os.path.dirname(sys.executable if FROZEN else os.path.abspath(__file__))
@@ -81,6 +81,7 @@ DEFAULTS = {
     "show_gpu": True,
     "show_ram": True,
     "auto_update": True,        # check GitHub for a new version on launch
+    "opengl_hook": False,       # load lowtide_gl64.dll into OpenGL games Windows can't see (like RTSS)
     "theme": "Rosé Pine Dawn",
     "custom_themes": {},        # name -> {role: "#rrggbb"}
     # action -> [modifier flags, virtual key code, label]; rebind them in the settings panel
@@ -363,6 +364,7 @@ class Capture:
         self.proc = None
         self.error = None
         self.started = time.time()
+        self.gl = None            # OpenGLHook, set by App
         self.last_row = 0.0       # any frame from any app, including the desktop (dwm)
 
     def status_text(self):
@@ -645,12 +647,9 @@ class MODULEENTRY32W(ctypes.Structure):
 _opengl_cache = {}
 
 
-def uses_opengl(pid):
-    """True if the process has opengl32.dll loaded. Classic OpenGL games present through GDI,
-    which Windows doesn't report to PresentMon (or any tool that doesn't inject)."""
-    if pid in _opengl_cache:
-        return _opengl_cache[pid]
-    found = False
+def module_names(pid):
+    """Lower-case names of the DLLs loaded in a process (empty if it can't be read)."""
+    names = []
     kernel32.CreateToolhelp32Snapshot.restype = wt.HANDLE
     snap = kernel32.CreateToolhelp32Snapshot(0x8 | 0x10, pid)  # SNAPMODULE | SNAPMODULE32
     if snap and snap != wt.HANDLE(-1).value:
@@ -659,14 +658,198 @@ def uses_opengl(pid):
             me.dwSize = ctypes.sizeof(me)
             ok = kernel32.Module32FirstW(snap, ctypes.byref(me))
             while ok:
-                if me.szModule.lower() == "opengl32.dll":
-                    found = True
-                    break
+                names.append(me.szModule.lower())
                 ok = kernel32.Module32NextW(snap, ctypes.byref(me))
         finally:
             kernel32.CloseHandle(snap)
-    _opengl_cache[pid] = found
-    return found
+    return names
+
+
+def uses_opengl(pid):
+    """True if the process has opengl32.dll loaded. Classic OpenGL games present through GDI,
+    which Windows doesn't report to PresentMon (or any tool that doesn't inject)."""
+    if pid not in _opengl_cache:
+        _opengl_cache[pid] = "opengl32.dll" in module_names(pid)
+    return _opengl_cache[pid]
+
+
+# ----------------------------------------------------------------- OpenGL hook (opt-in)
+# Parts of names that mean a game runs anti-cheat: loading anything into those can get you
+# flagged or banned, so Lowtide never does.
+ANTI_CHEAT = ("easyanticheat", "eac_", "beclient", "battleye", "bedaisy", "vgc", "vanguard",
+              "gameguard", "npggnt", "xigncode", "x3.xem", "nprotect", "ace-base", "acebase",
+              "anticheat", "anti-cheat", "punkbuster", "pnkbstr", "faceit", "esportal",
+              "mhyprot", "ricochet", "equ8", "hackshield", "wellbia", "denuvo-anti")
+GL_RING = 8192
+GL_DLL = os.path.join(RES, "lib", "lowtide_gl64.dll")
+
+
+class GLShared(ctypes.Structure):
+    _fields_ = [("magic", ctypes.c_long), ("version", ctypes.c_long),
+                ("qpc_freq", ctypes.c_longlong), ("count", ctypes.c_longlong),
+                ("qpc", ctypes.c_longlong * GL_RING)]
+
+
+class OpenGLHook:
+    """Times OpenGL games that Windows can't see, by loading lowtide_gl64.dll into them
+    (what RTSS does). Only used when "Measure OpenGL games" is on, only on the game in
+    front, and never on a game with anti-cheat."""
+
+    def __init__(self, capture, settings):
+        self.cap = capture
+        self.settings = settings
+        self.views = {}      # pid -> [mapping handle, GLShared pointer, frames read, last qpc, name]
+        self.status = {}     # pid -> "hooked" / reason it wasn't
+        self.dll = None
+        kernel32.OpenFileMappingW.restype = wt.HANDLE
+        kernel32.MapViewOfFile.restype = ctypes.c_void_p
+        kernel32.MapViewOfFile.argtypes = [wt.HANDLE, wt.DWORD, wt.DWORD, wt.DWORD, ctypes.c_size_t]
+        kernel32.VirtualAllocEx.restype = ctypes.c_void_p
+        kernel32.VirtualAllocEx.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wt.DWORD, wt.DWORD]
+        kernel32.WriteProcessMemory.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
+                                                ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+        kernel32.GetProcAddress.restype = ctypes.c_void_p
+        kernel32.GetProcAddress.argtypes = [wt.HMODULE, ctypes.c_char_p]
+        kernel32.GetModuleHandleW.restype = wt.HMODULE
+        kernel32.CreateRemoteThread.restype = wt.HANDLE
+        kernel32.CreateRemoteThread.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
+                                                ctypes.c_void_p, wt.DWORD, ctypes.c_void_p]
+        kernel32.OpenProcess.restype = wt.HANDLE
+        threading.Thread(target=self._poll, daemon=True).start()
+
+    def _dll_copy(self):
+        """Inject a copy in %TEMP%, so a game holding it open never blocks updating Lowtide."""
+        if self.dll and os.path.isfile(self.dll):
+            return self.dll
+        folder = os.path.join(os.environ.get("TEMP", DATA), "Lowtide")
+        os.makedirs(folder, exist_ok=True)
+        dst = os.path.join(folder, f"lowtide_gl64-{VERSION}.dll")
+        if not os.path.isfile(dst):
+            shutil.copyfile(GL_DLL, dst)
+        self.dll = dst
+        return dst
+
+    def blocked_reason(self, pid):
+        """Why this process must not be hooked, or None if it's fine."""
+        mods = module_names(pid)
+        if not mods:
+            return "couldn't read it"
+        if any(tag in m for m in mods for tag in ANTI_CHEAT):
+            return "it runs anti-cheat"
+        exe = ctypes.create_unicode_buffer(1024)
+        size = wt.DWORD(len(exe))
+        h = kernel32.OpenProcess(0x1000, False, pid)
+        if h:
+            if kernel32.QueryFullProcessImageNameW(h, 0, exe, ctypes.byref(size)):
+                folder = os.path.dirname(exe.value)
+                try:
+                    if any(tag in f.lower() for f in os.listdir(folder) for tag in ANTI_CHEAT):
+                        return "it ships with anti-cheat"
+                except OSError:
+                    pass
+            wow64 = wt.BOOL()
+            kernel32.IsWow64Process(h, ctypes.byref(wow64))
+            kernel32.CloseHandle(h)
+            if wow64.value:
+                return "32-bit games aren't supported yet"
+        return None
+
+    def ensure(self, pid, name):
+        """Hook the game in front if allowed. Returns its status text, or None if hooked."""
+        if not self.settings.get("opengl_hook"):
+            return None
+        st = self.status.get(pid)
+        if st is None:
+            reason = self.blocked_reason(pid)
+            if reason:
+                self.status[pid] = reason
+            else:
+                self.status[pid] = "hooking"
+                threading.Thread(target=self._inject, args=(pid, name), daemon=True).start()
+            st = self.status[pid]
+        return None if st == "hooked" else st
+
+    def _inject(self, pid, name):
+        """The standard LoadLibraryW + CreateRemoteThread way of loading a DLL into a process."""
+        try:
+            path = self._dll_copy()
+            data = ctypes.create_unicode_buffer(path)
+            nbytes = ctypes.sizeof(data)
+            h = kernel32.OpenProcess(0x2 | 0x8 | 0x10 | 0x20 | 0x400, False, pid)
+            if not h:
+                self.status[pid] = "couldn't open it"
+                return
+            try:
+                mem = kernel32.VirtualAllocEx(h, None, nbytes, 0x3000, 0x04)  # COMMIT|RESERVE, RW
+                written = ctypes.c_size_t()
+                kernel32.WriteProcessMemory(h, mem, data, nbytes, ctypes.byref(written))
+                load = kernel32.GetProcAddress(kernel32.GetModuleHandleW("kernel32.dll"), b"LoadLibraryW")
+                t = kernel32.CreateRemoteThread(h, None, 0, load, mem, 0, None)
+                if not t:
+                    self.status[pid] = "couldn't load into it"
+                    return
+                kernel32.WaitForSingleObject(t, 5000)
+                kernel32.CloseHandle(t)
+                kernel32.VirtualFreeEx(h, ctypes.c_void_p(mem), 0, 0x8000)
+            finally:
+                kernel32.CloseHandle(h)
+            for _ in range(50):   # the DLL sets up its shared memory on its own thread
+                if self._attach(pid, name):
+                    self.status[pid] = "hooked"
+                    return
+                time.sleep(0.1)
+            self.status[pid] = "the hook didn't start"
+        except Exception:
+            self.status[pid] = "the hook failed"
+
+    def _attach(self, pid, name):
+        m = kernel32.OpenFileMappingW(0x4, False, f"Local\\LowtideGL_{pid}")  # FILE_MAP_READ
+        if not m:
+            return False
+        view = kernel32.MapViewOfFile(m, 0x4, 0, 0, ctypes.sizeof(GLShared))
+        if not view:
+            kernel32.CloseHandle(m)
+            return False
+        shared = ctypes.cast(view, ctypes.POINTER(GLShared)).contents
+        if shared.magic != 0x4C47544C:
+            kernel32.UnmapViewOfFile(ctypes.c_void_p(view))
+            kernel32.CloseHandle(m)
+            return False
+        self.views[pid] = [m, view, shared, shared.count, None, name]
+        return True
+
+    def _poll(self):
+        """Turns the timestamps into frame times, 20 times a second."""
+        while True:
+            time.sleep(0.05)
+            for pid, v in list(self.views.items()):
+                m, view, shared, read, last, name = v
+                count = shared.count
+                if count - read > GL_RING:          # fell behind; skip the overwritten part
+                    read, last = count - GL_RING, None
+                fts = []
+                freq = shared.qpc_freq or 1
+                while read < count:
+                    q = shared.qpc[read % GL_RING]
+                    if last is not None and q > last:
+                        fts.append((q - last) * 1000.0 / freq)
+                    last = q
+                    read += 1
+                v[3], v[4] = read, last
+                if fts:
+                    now = time.time()
+                    with self.cap.lock:
+                        ps = self.cap.procs.get((pid, "opengl"))
+                        if ps is None:
+                            ps = self.cap.procs[(pid, "opengl")] = ProcStats(name)
+                        for ft in fts:
+                            if 0.0 < ft < 2000.0:
+                                ps.add(now, ft, self.settings["window_seconds"])
+                if not process_name(pid):           # game closed
+                    kernel32.UnmapViewOfFile(ctypes.c_void_p(view))
+                    kernel32.CloseHandle(m)
+                    del self.views[pid]
+                    self.status.pop(pid, None)
 
 
 def colorref(hex_color):
@@ -713,6 +896,7 @@ class Overlay:
         user32.SetWindowLongW(self.hwnd, GWL_EXSTYLE, style)
         self.last_key = None
         self.fg_pid, self.fg_name = 0, ""
+        self.gl_status = None
         self._stats_cache = None
         self.size = None
         self.unlocked = False
@@ -799,8 +983,12 @@ class Overlay:
         fg_keys = [k for k in procs if k[0] == fg]
         if fg_keys:
             return busiest(fg_keys)       # the game's main swap chain presents the most
-        if self.fg_name.lower() in self.PASS_THROUGH and self.last_key in procs:
-            return self.last_key
+        if self.fg_name.lower() in self.PASS_THROUGH:
+            return self.last_key if self.last_key in procs else None
+        # an OpenGL game Windows can't see: hook it if that's switched on (it shows up above
+        # as soon as frames arrive)
+        if fg and self.cap.gl and uses_opengl(fg):
+            self.gl_status = self.cap.gl.ensure(fg, self.fg_name)
         return None
 
     def idle_text(self, short=False):
@@ -810,11 +998,17 @@ class Overlay:
             return base
         if self.fg_name.lower() not in self.PASS_THROUGH and uses_opengl(self.fg_pid):
             name = self.fg_name.removesuffix(".exe").removesuffix(".EXE")
+            if self.s.get("opengl_hook"):
+                st = self.gl_status
+                if st in (None, "hooking"):
+                    return f"Hooking into {name}..." if not short else f"Hooking {name}..."
+                return f"Can't measure {name}: {st}"
             if short:
                 return f"{name} uses OpenGL: switch to full view for the fix"
             return (f"{name} uses OpenGL, which Windows doesn't report frames for. "
                     "Fix: NVIDIA Control Panel > Manage 3D settings > Vulkan/OpenGL present method "
-                    "> Prefer layered on DXGI swapchain, then restart the game.")
+                    "> Prefer layered on DXGI swapchain, then restart the game. "
+                    "Or turn on \"Measure OpenGL games\" in Lowtide's settings.")
         return base
 
     def toggle(self):
@@ -1213,6 +1407,10 @@ class SettingsPanel:
         setting_switch(c, "show_cpu", "CPU temp and usage")
         setting_switch(c, "show_gpu", "GPU temp and usage")
         setting_switch(c, "show_ram", "RAM usage")
+        setting_switch(c, "opengl_hook", "Measure OpenGL games (hooks in, like RTSS)")
+        tk.Label(c, text="For OpenGL games Windows can't see, like Geometry Dash. Never used on games "
+                         "with anti-cheat, but use it at your own risk in online games.",
+                 font=(FONT, 9), fg=MUTED, bg=SURFACE, wraplength=330, justify="left").pack(anchor="w")
         if not pawnio_installed():
             row = tk.Frame(c, bg=SURFACE, cursor="hand2")
             row.pack(fill="x", pady=(6, 0))
@@ -1586,6 +1784,7 @@ class App:
         apply_theme(self.settings)
         load_fonts()
         self.cap = Capture(find_presentmon(), self.settings)
+        self.cap.gl = OpenGLHook(self.cap, self.settings) if os.path.isfile(GL_DLL) else None
         self.sensors = Sensors()
         self.root = tk.Tk()
         self.root.title(APP)

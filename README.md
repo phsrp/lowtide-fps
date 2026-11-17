@@ -104,11 +104,15 @@ CPU temps need the free [PawnIO](https://pawnio.eu/) driver, the same one LibreH
 
 ### OpenGL games (Geometry Dash, Minecraft Java...)
 
-Older OpenGL games draw in a way Windows doesn't report, so no tool that reads Windows' frame data can see them (RTSS gets around it by injecting into the game). Lowtide tells you when the game in front is one of these. With an NVIDIA card, there's a quick fix that often lowers input lag too:
+Older OpenGL games draw in a way Windows doesn't report, so no tool that reads Windows' frame data can see them. Lowtide tells you when the game in front is one of these. There are two fixes:
+
+**With an NVIDIA card (recommended):** this often lowers input lag too, and every tool can see the game afterwards.
 
 1. **NVIDIA Control Panel** → **Manage 3D settings** → **Program Settings**, and pick the game (or use **Global Settings**).
 2. Set **Vulkan/OpenGL present method** to **Prefer layered on DXGI swapchain** and click **Apply**.
 3. Restart the game.
+
+**Any GPU: "Measure OpenGL games" in settings** (off by default). Lowtide loads a tiny DLL into the game that times each frame, the same way RTSS does. It's only used on the OpenGL game in front that Windows can't see, and **never on a game that runs anti-cheat** (Easy Anti-Cheat, BattlEye, Vanguard and others are detected and skipped). Loading code into a game is still what anti-cheat looks for, so use it at your own risk in online games. 64-bit games only for now. Checked against a test program's own frame timing: identical average, 1% and 0.1% lows, and every frame within 0.15 ms.
 
 ### Updating
 
@@ -135,14 +139,14 @@ So a bigger number on the left always means a newer version: `1.0.1` is newer th
 
 ## Building
 
-Needs Python 3.14 and [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`winget install JRSoftware.InnoSetup`).
+Needs Python 3.14, [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`winget install JRSoftware.InnoSetup`) and LLVM-MinGW (`winget install MartinStorsjo.LLVM-MinGW.UCRT`).
 
 ```
 pip install pyinstaller pystray pillow
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
-`build.ps1` downloads PresentMon, LibreHardwareMonitor and the PawnIO setup, compiles `lib/SensorHelper.cs` with the C# compiler that ships with Windows, builds the exe with PyInstaller and the installer with Inno Setup. The installer lands in `release/`.
+`build.ps1` downloads PresentMon, LibreHardwareMonitor and the PawnIO setup, compiles `lib/SensorHelper.cs` with the C# compiler that ships with Windows and `native/lowtide_gl.c` with LLVM-MinGW, builds the exe with PyInstaller and the installer with Inno Setup. The installer lands in `release/`.
 
 To run it from source: `python lowtide.py` (after `build.ps1` has fetched the dependencies once).
 

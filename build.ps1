@@ -40,6 +40,17 @@ if (-not (Test-Path installer\deps\PawnIO_setup.exe)) {
 & "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /platform:x64 /out:lib\SensorHelper.exe /r:lib\LibreHardwareMonitorLib.dll lib\SensorHelper.cs
 if ($LASTEXITCODE) { throw "SensorHelper build failed" }
 
+# 3b. OpenGL timing DLL (needs LLVM-MinGW: winget install MartinStorsjo.LLVM-MinGW.UCRT)
+$gcc = Get-Command x86_64-w64-mingw32-gcc -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+if (-not $gcc) {
+    $gcc = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Directory -Filter "MartinStorsjo.LLVM-MinGW*" -ErrorAction SilentlyContinue |
+        ForEach-Object { Get-ChildItem $_.FullName -Recurse -Filter x86_64-w64-mingw32-gcc.exe } | Select-Object -First 1 -ExpandProperty FullName
+}
+if (-not $gcc) { throw "x86_64-w64-mingw32-gcc not found (winget install MartinStorsjo.LLVM-MinGW.UCRT)" }
+& $gcc -O2 -shared -s -o lib\lowtide_gl64.dll native\lowtide_gl.c native\minhook\src\buffer.c native\minhook\src\hook.c `
+    native\minhook\src\trampoline.c native\minhook\src\hde\hde64.c -Inative\minhook\include
+if ($LASTEXITCODE) { throw "lowtide_gl64.dll build failed" }
+
 # 4. Exe (one folder, asks for admin through its manifest)
 python -m PyInstaller --noconfirm --clean --windowed --onedir --uac-admin `
     --name Lowtide --icon assets\lowtide.ico `

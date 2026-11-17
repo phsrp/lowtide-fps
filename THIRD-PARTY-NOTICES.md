@@ -12,6 +12,7 @@ The Lowtide installer includes these, unmodified:
 | [pystray](https://github.com/moses-palmer/pystray) | Tray icon | LGPL-3.0 |
 | [Pillow](https://python-pillow.org/) | Images | MIT-CMU |
 | [PyInstaller](https://pyinstaller.org/) bootloader | Exe | GPL-2.0 with bootloader exception |
+| [MinHook](https://github.com/TsudaKageyu/minhook) 1.3.4 by Tsuda Kageyu (with Hacker Disassembler Engine by Vyacheslav Patkov) | OpenGL frame timing DLL | BSD-2-Clause (see `native/minhook/LICENSE.txt`) |
 
 Colours: [Rosé Pine](https://rosepinetheme.com/) Dawn (MIT).
 
